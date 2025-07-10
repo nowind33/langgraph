@@ -4,6 +4,7 @@ import asyncio
 import concurrent
 import concurrent.futures
 import queue
+import warnings
 import weakref
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
@@ -23,7 +24,7 @@ from langchain_core.runnables.config import (
 )
 from langchain_core.runnables.graph import Graph
 from pydantic import BaseModel
-from typing_extensions import Self
+from typing_extensions import Self, Unpack
 
 from langgraph._internal._config import (
     ensure_config,
@@ -44,6 +45,7 @@ from langgraph._internal._runnable import (
     RunnableSeq,
     coerce_to_runnable,
 )
+from langgraph._internal._typing import DeprecatedKwargs
 from langgraph.cache.base import BaseCache
 from langgraph.channels.base import BaseChannel
 from langgraph.channels.topic import Topic
@@ -57,10 +59,10 @@ from langgraph.constants import (
     CACHE_NS_WRITES,
     CONF,
     CONFIG_KEY_CACHE,
-    CONFIG_KEY_CHECKPOINT_DURING,
     CONFIG_KEY_CHECKPOINT_ID,
     CONFIG_KEY_CHECKPOINT_NS,
     CONFIG_KEY_CHECKPOINTER,
+    CONFIG_KEY_DURABILITY,
     CONFIG_KEY_NODE_FINISHED,
     CONFIG_KEY_READ,
     CONFIG_KEY_RUNNER_SUBMIT,
@@ -118,6 +120,7 @@ from langgraph.types import (
     All,
     CachePolicy,
     Checkpointer,
+    Durability,
     Interrupt,
     Send,
     StateSnapshot,
@@ -125,6 +128,7 @@ from langgraph.types import (
     StreamMode,
 )
 from langgraph.typing import InputT, OutputT, StateT
+from langgraph.warnings import LangGraphDeprecatedSinceV10
 
 try:
     from langchain_core.tracers._streaming import _StreamingCallbackHandler
@@ -2288,6 +2292,8 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
         output_keys: str | Sequence[str] | None,
         interrupt_before: All | Sequence[str] | None,
         interrupt_after: All | Sequence[str] | None,
+        durability: Durability | None = None,
+        kwargs: DeprecatedKwargs,
     ) -> tuple[
         set[StreamMode],
         str | Sequence[str],
@@ -2296,6 +2302,7 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
         BaseCheckpointSaver | None,
         BaseStore | None,
         BaseCache | None,
+        Durability,
     ]:
         if config["recursion_limit"] < 1:
             raise ValueError("recursion_limit must be at least 1")
@@ -2334,6 +2341,26 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
             cache: BaseCache | None = config[CONF][CONFIG_KEY_CACHE]
         else:
             cache = self.cache
+        if "checkpoint_during" in kwargs:
+            warnings.warn(
+                "`checkpoint_during` is deprecated and will be removed. Please use `durability` instead.",
+                category=LangGraphDeprecatedSinceV10,
+            )
+            if durability is not None:
+                raise ValueError(
+                    "Cannot use both `checkpoint_during` and `durability` parameters."
+                )
+            elif kwargs["checkpoint_during"] is True:
+                durability = "async"
+            else:
+                durability = "exit"
+        if durability is not None and checkpointer is None:
+            warnings.warn(
+                "`durability` has no effect when no checkpointer is present.",
+                category=LangGraphDeprecatedSinceV10,
+            )
+        if durability is None:
+            durability = config.get(CONF, {}).get(CONFIG_KEY_DURABILITY, "async")
         return (
             stream_modes,
             output_keys,
@@ -2342,6 +2369,7 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
             checkpointer,
             store,
             cache,
+            durability,
         )
 
     def stream(
@@ -2354,9 +2382,9 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
         output_keys: str | Sequence[str] | None = None,
         interrupt_before: All | Sequence[str] | None = None,
         interrupt_after: All | Sequence[str] | None = None,
-        checkpoint_during: bool | None = None,
-        debug: bool | None = None,
+        durability: Durability | None = None,
         subgraphs: bool = False,
+        **kwargs: Unpack[DeprecatedKwargs],
     ) -> Iterator[dict[str, Any] | Any]:
         """Stream graph steps for a single input.
 
@@ -2384,7 +2412,10 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
             output_keys: The keys to stream, defaults to all non-context channels.
             interrupt_before: Nodes to interrupt before, defaults to all nodes in the graph.
             interrupt_after: Nodes to interrupt after, defaults to all nodes in the graph.
-            checkpoint_during: Whether to checkpoint intermediate steps, defaults to False. If False, only the final checkpoint is saved.
+            durability: The durability mode for the graph execution, defaults to "async". Options are:
+                - `"sync"`: Changes are persisted synchronously before the next step starts.
+                - `"async"`: Changes are persisted asynchronously while the next step executes.
+                - `"exit"`: Changes are persisted only when the graph exits.
             subgraphs: Whether to stream events from inside subgraphs, defaults to False.
                 If True, the events will be emitted as tuples `(namespace, data)`,
                 or `(namespace, mode, data)` if `stream_mode` is a list,
@@ -2405,7 +2436,7 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
                 if config is not None and CONFIG_KEY_TASK_ID in config.get(CONF, {})
                 else self.stream_mode
             )
-        if debug or self.debug:
+        if kwargs.get("debug") or self.debug:
             print_mode = ["updates", "values"]
 
         stream = SyncQueue()
@@ -2428,6 +2459,7 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
                 checkpointer,
                 store,
                 cache,
+                durability_,
             ) = self._defaults(
                 config,
                 stream_mode=stream_mode,
@@ -2435,6 +2467,8 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
                 output_keys=output_keys,
                 interrupt_before=interrupt_before,
                 interrupt_after=interrupt_after,
+                durability=durability,
+                kwargs=kwargs,
             )
             # set up subgraph checkpointing
             if self.checkpointer is True:
@@ -2464,9 +2498,9 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
             ):
                 # remove parent graph stream writer if subgraph streaming not requested
                 del config[CONF][CONFIG_KEY_STREAM_WRITER]
-            # set checkpointing mode for subgraphs
-            if checkpoint_during is not None:
-                config[CONF][CONFIG_KEY_CHECKPOINT_DURING] = checkpoint_during
+            # set durability mode for subgraphs
+            if durability is not None or kwargs.get("checkpoint_during") is not None:
+                config[CONF][CONFIG_KEY_DURABILITY] = durability_
             with SyncPregelLoop(
                 input,
                 stream=StreamProtocol(stream.put, stream_modes),
@@ -2482,9 +2516,7 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
                 interrupt_before=interrupt_before_,
                 interrupt_after=interrupt_after_,
                 manager=run_manager,
-                checkpoint_during=checkpoint_during
-                if checkpoint_during is not None
-                else config[CONF].get(CONFIG_KEY_CHECKPOINT_DURING, True),
+                durability=durability_,
                 trigger_to_nodes=self.trigger_to_nodes,
                 migrate_checkpoint=self._migrate_checkpoint,
                 retry_policy=self.retry_policy,
@@ -2545,6 +2577,9 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
                             stream_mode, print_mode, subgraphs, stream.get, queue.Empty
                         )
                     loop.after_tick()
+                    # wait for checkpoint
+                    if durability_ == "sync":
+                        loop._put_checkpoint_fut.result()
             # emit output
             yield from _output(
                 stream_mode, print_mode, subgraphs, stream.get, queue.Empty
@@ -2576,9 +2611,9 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
         output_keys: str | Sequence[str] | None = None,
         interrupt_before: All | Sequence[str] | None = None,
         interrupt_after: All | Sequence[str] | None = None,
-        checkpoint_during: bool | None = None,
-        debug: bool | None = None,
+        durability: Durability | None = None,
         subgraphs: bool = False,
+        **kwargs: Unpack[DeprecatedKwargs],
     ) -> AsyncIterator[dict[str, Any] | Any]:
         """Asynchronously stream graph steps for a single input.
 
@@ -2605,7 +2640,10 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
             output_keys: The keys to stream, defaults to all non-context channels.
             interrupt_before: Nodes to interrupt before, defaults to all nodes in the graph.
             interrupt_after: Nodes to interrupt after, defaults to all nodes in the graph.
-            checkpoint_during: Whether to checkpoint intermediate steps, defaults to False. If False, only the final checkpoint is saved.
+            durability: The durability mode for the graph execution, defaults to "async". Options are:
+                - `"sync"`: Changes are persisted synchronously before the next step starts.
+                - `"async"`: Changes are persisted asynchronously while the next step executes.
+                - `"exit"`: Changes are persisted only when the graph exits.
             subgraphs: Whether to stream events from inside subgraphs, defaults to False.
                 If True, the events will be emitted as tuples `(namespace, data)`,
                 or `(namespace, mode, data)` if `stream_mode` is a list,
@@ -2626,7 +2664,7 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
                 if config is not None and CONFIG_KEY_TASK_ID in config.get(CONF, {})
                 else self.stream_mode
             )
-        if debug or self.debug:
+        if kwargs.get("debug") or self.debug:
             print_mode = ["updates", "values"]
 
         stream = AsyncQueue()
@@ -2668,6 +2706,7 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
                 checkpointer,
                 store,
                 cache,
+                durability_,
             ) = self._defaults(
                 config,
                 stream_mode=stream_mode,
@@ -2675,6 +2714,8 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
                 output_keys=output_keys,
                 interrupt_before=interrupt_before,
                 interrupt_after=interrupt_after,
+                durability=durability,
+                kwargs=kwargs,
             )
             # set up subgraph checkpointing
             if self.checkpointer is True:
@@ -2708,8 +2749,8 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
                 # remove parent graph stream writer if subgraph streaming not requested
                 del config[CONF][CONFIG_KEY_STREAM_WRITER]
             # set checkpointing mode for subgraphs
-            if checkpoint_during is not None:
-                config[CONF][CONFIG_KEY_CHECKPOINT_DURING] = checkpoint_during
+            if durability is not None or kwargs.get("checkpoint_during") is not None:
+                config[CONF][CONFIG_KEY_DURABILITY] = durability_
             async with AsyncPregelLoop(
                 input,
                 stream=StreamProtocol(stream.put_nowait, stream_modes),
@@ -2725,9 +2766,7 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
                 interrupt_before=interrupt_before_,
                 interrupt_after=interrupt_after_,
                 manager=run_manager,
-                checkpoint_during=checkpoint_during
-                if checkpoint_during is not None
-                else config[CONF].get(CONFIG_KEY_CHECKPOINT_DURING, True),
+                durability=durability_,
                 trigger_to_nodes=self.trigger_to_nodes,
                 migrate_checkpoint=self._migrate_checkpoint,
                 retry_policy=self.retry_policy,
@@ -2784,6 +2823,9 @@ class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, Ou
                         ):
                             yield o
                     loop.after_tick()
+                    # wait for checkpoint
+                    if durability_ == "sync":
+                        await cast(asyncio.Future, loop._put_checkpoint_fut)
             # emit output
             for o in _output(
                 stream_mode,
